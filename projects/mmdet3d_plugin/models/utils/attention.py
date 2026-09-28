@@ -18,8 +18,14 @@ from einops import rearrange
 from mmcv.runner import auto_fp16
 from mmcv.runner.base_module import BaseModule
 
-from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+except ImportError:
+    flash_attn_unpadded_kvpacked_func = None
+    unpad_input = None
+    pad_input = None
+    index_first_axis = None
 
 
 def _in_projection_packed(q, k, v, w, b = None):
