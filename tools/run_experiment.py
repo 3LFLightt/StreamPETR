@@ -175,11 +175,15 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
     # Instrument the actual tensors being processed.
     # ---------------------------------------------------------
     spatial = {
+        # A sparse-patch frame can call the backbone many times. These fields
+        # are reset before every model forward and accumulated by the hook.
         "backbone_input_shape": None,
-        "input_views": None,
+        "backbone_input_shapes": [],
+        "backbone_call_count": 0,
+        "input_views": 0,
         "input_height": None,
         "input_width": None,
-        "input_pixels_per_sample": None,
+        "input_pixels_per_sample": 0,
 
         # Exact image memory passed to PETR cross-attention.
         "cross_attention_image_tokens": None,
@@ -195,6 +199,21 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
         "decoder_layers": None,
     }
 
+    def reset_frame_spatial():
+        spatial["backbone_input_shape"] = None
+        spatial["backbone_input_shapes"] = []
+        spatial["backbone_call_count"] = 0
+        spatial["input_views"] = 0
+        spatial["input_height"] = None
+        spatial["input_width"] = None
+        spatial["input_pixels_per_sample"] = 0
+        spatial["cross_attention_image_tokens"] = None
+        spatial["cross_attention_query_tokens"] = None
+        spatial["temporal_memory_tokens"] = None
+        spatial["cross_attention_score_pairs_per_layer"] = None
+        spatial["temporal_attention_score_pairs_per_layer"] = None
+        spatial["decoder_layers"] = None
+
     def backbone_pre_hook(module, inputs):
         if not inputs:
             return
@@ -206,15 +225,18 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
 
         shape = tuple(int(v) for v in x.shape)
         spatial["backbone_input_shape"] = list(shape)
+        spatial["backbone_input_shapes"].append(list(shape))
+        spatial["backbone_call_count"] += 1
 
-        # StreamPETR flattens camera views into the batch dimension.
-        # Benchmark batch size is 1.
+        # Full-frame mode has one call with N cameras. Sparse-patch mode has
+        # one or more calls, normally with N=1. Sum every call for true
+        # backbone pixel work per frame.
         if x.dim() == 4:
             n, c, h, w = shape
-            spatial["input_views"] = n
+            spatial["input_views"] += n
             spatial["input_height"] = h
             spatial["input_width"] = w
-            spatial["input_pixels_per_sample"] = n * h * w
+            spatial["input_pixels_per_sample"] += n * h * w
 
     def transformer_pre_hook(module, inputs):
         # PETRTemporalTransformer.forward:
@@ -291,6 +313,7 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
     end_to_end_times = []
 
     torch.cuda.empty_cache()
+    spatial_samples = []
 
     for i in range(sample_limit):
 
@@ -303,7 +326,11 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
             break
 
         torch.cuda.synchronize()
+        reset_frame_spatial()
 
+        if i == warmup:
+            # Reset BEFORE the first measured forward, retaining its peak.
+            torch.cuda.reset_peak_memory_stats()
         model_start = time.perf_counter()
 
         with torch.no_grad():
@@ -318,8 +345,30 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
         model_elapsed = time.perf_counter() - model_start
         full_elapsed = time.perf_counter() - full_start
 
-        if i == warmup:
-            torch.cuda.reset_peak_memory_stats()
+        record = dict(spatial)
+        record.update(sample_index=i, measured=i >= warmup,
+                      model_latency_ms=1000*model_elapsed)
+        meta = data.get('img_metas')
+        while isinstance(meta, (list, tuple)) or hasattr(meta, 'data'):
+            if isinstance(meta, (list, tuple)):
+                meta = meta[0]
+            else:
+                meta = meta.data
+        if isinstance(meta, dict):
+            record['sample_token'] = meta.get('sample_idx')
+            record['oracle_tile_stats'] = meta.get('oracle_tile_stats')
+            record['sparse_camera_stats'] = meta.get('sparse_camera_stats')
+            record['sparse_runtime_stats'] = meta.get('sparse_runtime_stats')
+        q = record['cross_attention_query_tokens']
+        k = record['cross_attention_image_tokens']
+        t = record['temporal_memory_tokens']
+        layers = record['decoder_layers']
+        record['cross_attention_score_pairs_per_layer'] = q*k
+        record['cross_attention_score_pairs_all_decoder_layers'] = q*k*layers
+        if t is not None:
+            record['temporal_attention_score_pairs_per_layer'] = q*(q+t)
+            record['temporal_attention_score_pairs_all_decoder_layers'] = q*(q+t)*layers
+        spatial_samples.append(record)
 
         if i >= warmup:
             model_times.append(model_elapsed)
@@ -401,6 +450,28 @@ def benchmark_model(config_path, checkpoint_path, max_samples, warmup):
         )
     else:
         spatial["temporal_attention_score_pairs_all_decoder_layers"] = None
+
+    # Variable tile counts require aggregates, not the last frame's shape.
+    measured_spatial = [r for r in spatial_samples if r['measured']]
+    spatial['last_backbone_input_shape'] = spatial.pop('backbone_input_shape')
+    aggregate_keys = (
+        'backbone_call_count', 'input_views', 'input_height', 'input_width',
+        'input_pixels_per_sample',
+        'cross_attention_image_tokens', 'cross_attention_query_tokens',
+        'temporal_memory_tokens', 'cross_attention_score_pairs_per_layer',
+        'cross_attention_score_pairs_all_decoder_layers',
+        'temporal_attention_score_pairs_per_layer',
+        'temporal_attention_score_pairs_all_decoder_layers')
+    spatial['per_sample'] = spatial_samples
+    spatial['aggregate_scope'] = 'measured samples excluding warmup'
+    spatial['statistics'] = {}
+    for key in aggregate_keys:
+        values = [r[key] for r in measured_spatial if r.get(key) is not None]
+        if values:
+            spatial[key] = float(np.mean(values))
+            spatial['statistics'][key] = dict(mean=float(np.mean(values)),
+                min=float(np.min(values)), max=float(np.max(values)),
+                p95=float(np.percentile(values, 95)))
 
     performance = {
         "samples_measured": measured,
@@ -586,6 +657,9 @@ def main():
         config_path,
         run_dir / "{}_config.py".format(slug),
     )
+
+    from mmcv import Config
+    Config.fromfile(str(config_path)).dump(str(run_dir / 'resolved_config.py'))
 
     # Save git state/diff as well.
     git_info = git_metadata()

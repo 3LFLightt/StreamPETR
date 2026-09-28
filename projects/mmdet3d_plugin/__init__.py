@@ -8,3 +8,6 @@ from .models.detectors import *
 from .models.necks import *
 from .models.backbones import *
 
+from .datasets.oracle_tiles import OracleTileNuScenesDataset, OracleObjectTiles
+
+from .datasets.sparse_camera_rois import OracleSparseNuScenesDataset, OracleSparseCameraROIs
