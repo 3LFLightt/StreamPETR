@@ -1,0 +1,7 @@
+width=4096
+height=3072
+r_frame_rate=30/1
+avg_frame_rate=30/1
+duration=10.000000
+nb_frames=300
+duration=10.000000
